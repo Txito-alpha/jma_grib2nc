@@ -21,6 +21,7 @@ from qgis.core import (
     QgsProcessingParameterFileDestination,
     QgsProcessingParameterNumber,
     QgsProcessingParameterString,
+    QgsMeshDatasetIndex,
     QgsMeshLayer,
     QgsRasterLayer,
     QgsRectangle,
@@ -28,6 +29,7 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QCoreApplication
 
 from ..core.converter import ConversionError, Reporter, convert, find_files
+from .styles import PRECIP_DATASET_NAME, apply_mesh_precip_style
 
 # JMA GRIB2 grids use the GRS80 ellipsoid (JGD2000). The difference to WGS 84 / JGD2011
 # is far below the 1 km cell size, so extents are transformed to EPSG:4612.
@@ -228,6 +230,14 @@ class ConvertJmaGrib2Algorithm(QgsProcessingAlgorithm):
             return
         if not layer.crs().isValid():
             layer.setCrs(QgsCoordinateReferenceSystem(GRID_CRS))
+        group = apply_mesh_precip_style(layer)
+        if group >= 0:
+            styled = layer.datasetGroupMetadata(QgsMeshDatasetIndex(group)).name()
+            if styled != PRECIP_DATASET_NAME:
+                feedback.pushWarning(f"dataset '{PRECIP_DATASET_NAME}' not found; "
+                                     f"default style applied to '{styled}'")
+            feedback.pushInfo(f"mesh style: '{styled}' as contours, 0-80 mm, Spectral "
+                              "(inverted), equal interval 17 classes, 0 mm transparent")
         self._add_to_project(layer, name, self.OUTPUT_MESH, context)
         tp = layer.temporalProperties()
         span = ""
