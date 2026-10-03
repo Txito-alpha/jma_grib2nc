@@ -27,13 +27,13 @@ class JmaGrib2NcPlugin:
         self.action = QAction(icon, "気象庁GRIB2（ランレングス）→ NetCDF…",
                               self.iface.mainWindow())
         self.action.triggered.connect(self.run)
-        self.iface.addPluginToRasterMenu(MENU, self.action)
-        self.iface.addRasterToolBarIcon(self.action)
+        self.iface.addPluginToMenu(MENU, self.action)
+        self.iface.addToolBarIcon(self.action)
 
     def unload(self):
         if self.action:
-            self.iface.removePluginRasterMenu(MENU, self.action)
-            self.iface.removeRasterToolBarIcon(self.action)
+            self.iface.removePluginMenu(MENU, self.action)
+            self.iface.removeToolBarIcon(self.action)
             self.action = None
         if self.provider:
             QgsApplication.processingRegistry().removeProvider(self.provider)
