@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.nc
+.pytest_cache/
