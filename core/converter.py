@@ -138,6 +138,53 @@ def collect(paths: Sequence[str], reporter: Reporter,
     return grid, variables, n_skipped
 
 
+def subset_window(grid, bbox, tol: Optional[float] = None):
+    """Grid index window covering a lon/lat bounding box.
+
+    bbox = (west, south, east, north) in the grid's geographic CRS (degrees).
+    Every cell whose area intersects the box is selected, so the output always
+    covers the requested extent and keeps the original cell centres.
+    Returns (j0, j1, i0, i1, clipped) with half-open ranges in output order
+    (rows north -> south); clipped is True when the box extends beyond the grid.
+    Raises ConversionError when the box does not overlap the grid.
+
+    tol defaults to 1/1000 of a cell: the corner coordinates in GRIB2 are rounded to
+    1e-6 degrees, so computed cell edges can be ~3e-7 degrees off the nominal ones and a box
+    drawn exactly on a cell edge must not pull in the neighbouring row or column.
+    """
+    west, south, east, north = bbox
+    if west > east or south > north:
+        raise ConversionError("invalid extent (min > max)")
+    lats, lons = grid.lats(), grid.lons()
+    dy = (lats[0] - lats[-1]) / (len(lats) - 1)
+    dx = (lons[-1] - lons[0]) / (len(lons) - 1)
+    if tol is None:
+        tol = 1e-3 * min(dx, dy)
+    # a zero-width/height box (point feature, vertical/horizontal line) takes the cell(s)
+    # touching it, including both neighbours when it lies exactly on a cell edge
+    tx = -tol if east - west <= 2 * tol else tol
+    ty = -tol if north - south <= 2 * tol else tol
+    cols = np.flatnonzero((lons + dx / 2 > west + tx) & (lons - dx / 2 < east - tx))
+    rows = np.flatnonzero((lats + dy / 2 > south + ty) & (lats - dy / 2 < north - ty))
+    if cols.size == 0 or rows.size == 0:
+        raise ConversionError(
+            f"extent {west:.4f},{south:.4f} - {east:.4f},{north:.4f} does not overlap the grid "
+            f"({lons[0] - dx / 2:.4f},{lats[-1] - dy / 2:.4f} - "
+            f"{lons[-1] + dx / 2:.4f},{lats[0] + dy / 2:.4f})")
+    clipped = (west < lons[0] - dx / 2 - tol or east > lons[-1] + dx / 2 + tol
+               or south < lats[-1] - dy / 2 - tol or north > lats[0] + dy / 2 + tol)
+    j0, j1 = _at_least_two(int(rows[0]), int(rows[-1]) + 1, len(lats))
+    i0, i1 = _at_least_two(int(cols[0]), int(cols[-1]) + 1, len(lons))
+    return j0, j1, i0, i1, clipped
+
+
+def _at_least_two(a: int, b: int, n: int):
+    """GDAL cannot georeference a netCDF raster that is 1 cell wide or high: add a neighbour."""
+    if b - a >= 2 or n < 2:
+        return a, b
+    return (a, b + 1) if b < n else (a - 1, b)
+
+
 def _attr(obj, name, value):
     if isinstance(value, str):
         a = obj.CreateAttribute(name, [], gdal.ExtendedDataType.CreateString())
@@ -153,7 +200,7 @@ def _crs_wkt(name, a, rf, epsg):
             f'ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",{epsg}]]')
 
 
-def _write(out_path, grid, variables, times, zlevel, reporter, n_files):
+def _write(out_path, grid, variables, times, zlevel, reporter, n_files, win=None):
     gdal.UseExceptions()
     drv = gdal.GetDriverByName("netCDF")
     if drv is None:
@@ -171,7 +218,18 @@ def _write(out_path, grid, variables, times, zlevel, reporter, n_files):
 
     f64 = gdal.ExtendedDataType.Create(gdal.GDT_Float64)
     f32 = gdal.ExtendedDataType.Create(gdal.GDT_Float32)
-    nt, nj, ni = len(times), grid.nj, grid.ni
+    j0, j1, i0, i1 = win if win else (0, grid.nj, 0, grid.ni)
+    nt, nj, ni = len(times), j1 - j0, i1 - i0
+    lats, lons = grid.lats()[j0:j1], grid.lons()[i0:i1]
+    hy = (grid.lats()[0] - grid.lats()[-1]) / (grid.nj - 1) / 2
+    hx = (grid.lons()[-1] - grid.lons()[0]) / (grid.ni - 1) / 2
+    _attr(rg, "geospatial_lat_min", float(lats[-1] - hy))
+    _attr(rg, "geospatial_lat_max", float(lats[0] + hy))
+    _attr(rg, "geospatial_lon_min", float(lons[0] - hx))
+    _attr(rg, "geospatial_lon_max", float(lons[-1] + hx))
+    if win:
+        _attr(rg, "comment", f"spatial subset of the {grid.ni} x {grid.nj} source grid "
+                             f"(columns {i0}-{i1 - 1}, rows {j0}-{j1 - 1} from the north-west)")
     d_t = rg.CreateDimension("time", "TEMPORAL", None, nt)
     d_y = rg.CreateDimension("lat", "HORIZONTAL_Y", "NORTH", nj)
     d_x = rg.CreateDimension("lon", "HORIZONTAL_X", "EAST", ni)
@@ -194,12 +252,12 @@ def _write(out_path, grid, variables, times, zlevel, reporter, n_files):
         _attr(v_t, "bounds", "time_bnds")
 
     v_y = rg.CreateMDArray("lat", [d_y], f64)
-    v_y.Write(grid.lats())
+    v_y.Write(lats)
     _attr(v_y, "standard_name", "latitude")
     _attr(v_y, "units", "degrees_north")
     _attr(v_y, "axis", "Y")
     v_x = rg.CreateMDArray("lon", [d_x], f64)
-    v_x.Write(grid.lons())
+    v_x.Write(lons)
     _attr(v_x, "standard_name", "longitude")
     _attr(v_x, "units", "degrees_east")
     _attr(v_x, "axis", "X")
@@ -242,7 +300,7 @@ def _write(out_path, grid, variables, times, zlevel, reporter, n_files):
                 block = empty
             else:
                 try:
-                    d = decode(m)
+                    d = decode(m)[j0:j1, i0:i1]
                     block = np.where(np.isnan(d), FILL_VALUE, d).astype(np.float32)
                 except (Grib2Error, OSError, ValueError) as e:
                     reporter.warn(f"{os.path.basename(m.path)}: decode failed ({e}); "
@@ -257,8 +315,12 @@ def _write(out_path, grid, variables, times, zlevel, reporter, n_files):
 
 def convert(paths: Sequence[str], out_path: str, reporter: Optional[Reporter] = None,
             start: Optional[datetime] = None, end: Optional[datetime] = None,
-            zlevel: int = 4) -> dict:
-    """Convert GRIB2 files to one NetCDF file. Times are naive datetimes in UTC."""
+            zlevel: int = 4, bbox: Optional[Sequence[float]] = None) -> dict:
+    """Convert GRIB2 files to one NetCDF file.
+
+    Times are naive datetimes in UTC. bbox = (west, south, east, north) in degrees of the
+    grid's geographic CRS limits the output to the grid cells intersecting that box.
+    """
     reporter = reporter or Reporter()
     if not paths:
         raise ConversionError("no input files")
@@ -274,6 +336,18 @@ def convert(paths: Sequence[str], out_path: str, reporter: Optional[Reporter] = 
                       f"{v.attrs['long_name']} [{v.attrs['units']}]")
     reporter.info(f"time: {times[0]:%Y-%m-%d %H:%M} .. {times[-1]:%Y-%m-%d %H:%M} UTC, "
                   f"{len(times)} step(s)")
+    win = None
+    if bbox is not None:
+        j0, j1, i0, i1, clipped = subset_window(grid, bbox)
+        win = (j0, j1, i0, i1)
+        if clipped:
+            reporter.warn("the extent reaches beyond the grid; "
+                          "only the overlapping part is written")
+        lats, lons = grid.lats(), grid.lons()
+        reporter.info(f"spatial subset: {i1 - i0} x {j1 - j0} cells "
+                      f"(lon {lons[i0]:.5f}..{lons[i1 - 1]:.5f}, "
+                      f"lat {lats[j1 - 1]:.5f}..{lats[j0]:.5f}; cell centres), "
+                      f"{100.0 * (i1 - i0) * (j1 - j0) / (grid.ni * grid.nj):.2f}% of the grid")
 
     out_dir = os.path.dirname(os.path.abspath(out_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -283,7 +357,7 @@ def convert(paths: Sequence[str], out_path: str, reporter: Optional[Reporter] = 
     target, tmp_dir = out_path, None
     try:
         try:
-            ok = _write(target, grid, variables, times, zlevel, reporter, n_files)
+            ok = _write(target, grid, variables, times, zlevel, reporter, n_files, win)
         except RuntimeError as e:
             # netCDF-C on Windows may fail on non-ASCII paths: retry via a temp file
             reporter.warn(f"direct write failed ({e}); retrying through a temporary file")
@@ -291,7 +365,7 @@ def convert(paths: Sequence[str], out_path: str, reporter: Optional[Reporter] = 
                 os.remove(out_path)
             tmp_dir = tempfile.mkdtemp(prefix="grib2nc_")
             target = os.path.join(tmp_dir, "out.nc")
-            ok = _write(target, grid, variables, times, zlevel, reporter, n_files)
+            ok = _write(target, grid, variables, times, zlevel, reporter, n_files, win)
         if not ok:
             if os.path.exists(target):
                 os.remove(target)
@@ -305,4 +379,4 @@ def convert(paths: Sequence[str], out_path: str, reporter: Optional[Reporter] = 
     size_mb = os.path.getsize(out_path) / 1e6
     reporter.info(f"written {out_path} ({size_mb:.1f} MB)")
     return dict(canceled=False, output=out_path, variables=[v.name for v in variables.values()],
-                times=len(times), skipped=n_skipped)
+                times=len(times), skipped=n_skipped, window=win)

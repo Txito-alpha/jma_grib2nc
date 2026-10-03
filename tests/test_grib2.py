@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 
 from jma_grib2nc.core import grib2
-from jma_grib2nc.core.converter import Reporter, collect, convert
+from jma_grib2nc.core.converter import (ConversionError, Reporter, collect, convert,
+                                        subset_window)
 
 
 def _s32(v):
@@ -145,6 +146,51 @@ def test_convert_netcdf(sample, tmp_path):
     np.testing.assert_allclose(np.where(np.isnan(expect), -9999, expect), a, rtol=1e-6)
     gt = ds.GetGeoTransform()
     assert gt[0] == pytest.approx(139.995) and gt[3] == pytest.approx(48.005)
+
+
+def test_subset_window(sample):
+    files, _ = sample
+    g = grib2.scan_file(files[0])[0].grid   # lon 140.00..140.29, lat 48.00..47.61, 0.01 deg
+    # box inside the grid: every cell touching the box is taken
+    assert subset_window(g, (140.05, 47.80, 140.10, 47.90)) == (10, 21, 5, 11, False)
+    # box edges exactly on cell edges: neighbouring cells are not added
+    assert subset_window(g, (140.045, 47.795, 140.105, 47.905)) == (10, 21, 5, 11, False)
+    # partly outside -> clipped to the grid
+    assert subset_window(g, (139.0, 47.0, 140.02, 47.62)) == (38, 40, 0, 3, True)
+    with pytest.raises(ConversionError):
+        subset_window(g, (150.0, 30.0, 151.0, 31.0))
+    with pytest.raises(ConversionError):
+        subset_window(g, (140.2, 47.7, 140.1, 47.8))
+
+
+def test_subset_window_rounded_corners():
+    # JMA 1 km grid: corner coordinates rounded to 1e-6 deg (1/120 deg cells)
+    g = grib2.Grid(ni=2560, nj=3360, lat1=47.995833, lon1=118.00625, lat2=20.004167,
+                   lon2=149.99375, dx=0.0125, dy=0.008333, scan=0, earth_shape=4)
+    # 45.6N / 41.3N / 139.3E / 145.9E are exact cell edges: no extra row or column
+    assert subset_window(g, (139.3, 41.3, 145.9, 45.6)) == (288, 804, 1704, 2232, False)
+    # a point: the cell containing it (both neighbours when on a cell edge), widened to at
+    # least 2 x 2 cells because GDAL cannot georeference 1-cell-wide netCDF rasters
+    assert subset_window(g, (141.355, 43.06, 141.355, 43.06)) == (592, 594, 1868, 1870, False)
+    assert subset_window(g, (141.35, 43.06, 141.35, 43.06)) == (592, 594, 1867, 1869, False)
+    # at the last row / column the neighbour is taken on the inner side
+    assert subset_window(g, (149.999, 20.001, 149.999, 20.001)) == (3358, 3360, 2558, 2560, False)
+
+
+def test_convert_subset(sample, tmp_path):
+    gdal = pytest.importorskip("osgeo.gdal")
+    files, expect = sample
+    out = tmp_path / "subset.nc"
+    res = convert(files, str(out), bbox=(140.05, 47.80, 140.10, 47.90))
+    assert res["window"] == (10, 21, 5, 11)
+    ds = gdal.Open(f'NETCDF:"{out}":precip')
+    assert (ds.RasterXSize, ds.RasterYSize, ds.RasterCount) == (6, 11, 2)
+    a = ds.GetRasterBand(1).ReadAsArray()
+    sub = expect[10:21, 5:11]
+    np.testing.assert_allclose(np.where(np.isnan(sub), -9999, sub), a, rtol=1e-6)
+    gt = ds.GetGeoTransform()
+    assert gt[0] == pytest.approx(140.045) and gt[3] == pytest.approx(47.905)
+    assert gt[1] == pytest.approx(0.01) and gt[5] == pytest.approx(-0.01)
 
 
 @pytest.mark.skipif(not os.environ.get("JMA_GRIB2_SAMPLE"), reason="JMA_GRIB2_SAMPLE not set")

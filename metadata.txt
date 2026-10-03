@@ -2,8 +2,8 @@
 name=JMA GRIB2 to NetCDF
 qgisMinimumVersion=3.34
 description=Convert JMA run-length packed GRIB2 (Radar/Raingauge-Analyzed Precipitation, nowcasts, etc.) to CF NetCDF without extra libraries.
-about=Reads Japan Meteorological Agency GRIB2 files that use run-length packing (data representation template 5.200) - e.g. Radar/Raingauge-Analyzed Precipitation (解析雨量), Very-short-range Forecasting of Precipitation (降水短時間予報) and Precipitation Nowcasts - which GDAL cannot decode, and writes a CF-1.8 NetCDF-4 file with a time dimension. Pure Python decoder; requires only numpy and the GDAL bundled with QGIS (no wgrib2 / ecCodes needed). Available as a Processing algorithm (batch capable) and from the Raster menu. 気象庁のランレングス圧縮GRIB2をNetCDFに変換します。
-version=0.1.0
+about=Reads Japan Meteorological Agency GRIB2 files that use run-length packing (data representation template 5.200) - e.g. Radar/Raingauge-Analyzed Precipitation (解析雨量), Very-short-range Forecasting of Precipitation (降水短時間予報) and Precipitation Nowcasts - which GDAL cannot decode, and writes a CF-1.8 NetCDF-4 file with a time dimension. Pure Python decoder; requires only numpy and the GDAL bundled with QGIS (no wgrib2 / ecCodes needed). The output can be limited to an extent (map canvas, layer, drawn) or to the extent of (selected) features. Available as a Processing algorithm (batch capable) and from the Raster menu. 気象庁のランレングス圧縮GRIB2をNetCDFに変換します。
+version=0.2.0
 author=Txito
 email=22rinya05@gmail.com
 tracker=https://github.com/Txito-alpha/jma_grib2nc/issues
@@ -15,4 +15,5 @@ icon=icon.png
 experimental=True
 deprecated=False
 hasProcessingProvider=yes
-changelog=0.1.0 First release: template 5.200 decoder, CF NetCDF-4 output, period filter, skip-and-log for unsupported files.
+changelog=0.2.0 Output extent option: map canvas / layer / drawn extent or the extent of (selected) features, snapped outward to whole grid cells, any CRS.
+  0.1.0 First release: template 5.200 decoder, CF NetCDF-4 output, period filter, skip-and-log for unsupported files.
