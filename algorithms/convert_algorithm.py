@@ -10,15 +10,18 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingContext,
     QgsProcessingException,
+    QgsProcessingOutputMapLayer,
     QgsProcessingOutputRasterLayer,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterDateTime,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterExtent,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterFile,
     QgsProcessingParameterFileDestination,
     QgsProcessingParameterNumber,
     QgsProcessingParameterString,
+    QgsMeshLayer,
     QgsRasterLayer,
     QgsRectangle,
 )
@@ -29,6 +32,8 @@ from ..core.converter import ConversionError, Reporter, convert, find_files
 # JMA GRIB2 grids use the GRS80 ellipsoid (JGD2000). The difference to WGS 84 / JGD2011
 # is far below the 1 km cell size, so extents are transformed to EPSG:4612.
 GRID_CRS = "EPSG:4612"
+# Above this many cells a mesh layer gets slow to open and draw (full 1 km grid = 8.6 M)
+MESH_CELL_WARNING = 2_000_000
 
 
 class _FeedbackReporter(Reporter):
@@ -64,8 +69,11 @@ class ConvertJmaGrib2Algorithm(QgsProcessingAlgorithm):
     EXTENT_FEATURES = "EXTENT_FEATURES"
     ZLEVEL = "ZLEVEL"
     LOAD = "LOAD"
+    LAYER_TYPE = "LAYER_TYPE"
     OUTPUT = "OUTPUT"
     OUTPUT_LAYER = "OUTPUT_LAYER"
+    OUTPUT_MESH = "OUTPUT_MESH"
+    LAYER_TYPES = ("mesh", "raster", "both")
 
     def tr(self, text):
         return QCoreApplication.translate("ConvertJmaGrib2Algorithm", text)
@@ -91,11 +99,16 @@ class ConvertJmaGrib2Algorithm(QgsProcessingAlgorithm):
             "・出力範囲：範囲（地図キャンバス／レイヤの範囲／描画など）または地物"
             "（「選択地物のみ」可）の範囲で切り出し可能。範囲にかかる格子セルをすべて含むよう"
             "セル境界に合わせて外側に広げ、座標は元の格子のまま。CRSは自動変換。"
-            "両方空欄なら全域\n\n"
+            "両方空欄なら全域\n"
+            "・地図への追加形式：メッシュ（既定）は時系列コントローラで時刻を切り替えて"
+            "アニメーション表示できる。ただし値はセル中心の頂点に置かれ、頂点間で補間して"
+            "描画される（外周は半セル内側になる）。セル単位で見たいときはラスタ"
+            "（1バンド＝1時刻）。全域の1km格子をメッシュで開くと重いので範囲指定を推奨\n\n"
             "Converts JMA run-length packed GRIB2 files (template 5.200) in a folder "
             "into a single CF-compliant NetCDF-4 file with a time dimension. "
             "Times are UTC. Optionally limit the output to an extent or to the extent of "
-            "(selected) features; the window is snapped outward to whole grid cells."
+            "(selected) features; the window is snapped outward to whole grid cells. "
+            "The result can be added as a mesh layer (time-aware) or a raster layer."
         )
 
     def initAlgorithm(self, config=None):
@@ -120,10 +133,18 @@ class ConvertJmaGrib2Algorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber.Integer, defaultValue=4, minValue=0, maxValue=9))
         self.addParameter(QgsProcessingParameterBoolean(
             self.LOAD, self.tr("変換後に地図に追加する"), defaultValue=True))
+        self.addParameter(QgsProcessingParameterEnum(
+            self.LAYER_TYPE, self.tr("地図に追加する形式"),
+            options=[self.tr("メッシュ（時系列コントローラ対応）"),
+                     self.tr("ラスタ（1バンド＝1時刻）"),
+                     self.tr("メッシュとラスタの両方")],
+            defaultValue=0))
         self.addParameter(QgsProcessingParameterFileDestination(
             self.OUTPUT, self.tr("出力NetCDF"), fileFilter="NetCDF (*.nc)"))
         self.addOutput(QgsProcessingOutputRasterLayer(
-            self.OUTPUT_LAYER, self.tr("変換結果レイヤ")))
+            self.OUTPUT_LAYER, self.tr("変換結果（ラスタ）")))
+        self.addOutput(QgsProcessingOutputMapLayer(
+            self.OUTPUT_MESH, self.tr("変換結果（メッシュ）")))
 
     def processAlgorithm(self, parameters, context, feedback):
         folder = self.parameterAsFile(parameters, self.INPUT_FOLDER, context)
@@ -135,6 +156,7 @@ class ConvertJmaGrib2Algorithm(QgsProcessingAlgorithm):
             if parameters.get(self.END) else None
         zlevel = self.parameterAsInt(parameters, self.ZLEVEL, context)
         load = self.parameterAsBoolean(parameters, self.LOAD, context)
+        layer_type = self.LAYER_TYPES[self.parameterAsEnum(parameters, self.LAYER_TYPE, context)]
         out_path = self.parameterAsFileOutput(parameters, self.OUTPUT, context)
         if not out_path.lower().endswith(".nc"):
             out_path += ".nc"
@@ -169,19 +191,52 @@ class ConvertJmaGrib2Algorithm(QgsProcessingAlgorithm):
         var = result["variables"][0]
         uri = f'NETCDF:"{out_path}":{var}'
         outputs[self.OUTPUT_LAYER] = uri
-        if load:
-            name = f"{os.path.splitext(os.path.basename(out_path))[0]} ({var})"
-            layer = QgsRasterLayer(uri, name, "gdal")
-            if layer.isValid():
-                context.temporaryLayerStore().addMapLayer(layer)
-                context.addLayerToLoadOnCompletion(
-                    layer.id(),
-                    QgsProcessingContext.LayerDetails(name, context.project(), self.OUTPUT_LAYER))
-                feedback.pushInfo(f"layer added: {name}, {layer.bandCount()} band(s) "
-                                  "(1 band = 1 time step)")
-            else:
-                feedback.pushWarning("output written but could not be opened as a layer: " + uri)
+        outputs[self.OUTPUT_MESH] = out_path
+        if not load:
+            return outputs
+        base = os.path.splitext(os.path.basename(out_path))[0]
+        if layer_type in ("mesh", "both"):
+            self._add_mesh(out_path, f"{base} ({var}, mesh)", result, context, feedback)
+        if layer_type in ("raster", "both"):
+            self._add_raster(uri, f"{base} ({var})", context, feedback)
         return outputs
+
+    def _add_to_project(self, layer, name, output, context):
+        context.temporaryLayerStore().addMapLayer(layer)
+        context.addLayerToLoadOnCompletion(
+            layer.id(), QgsProcessingContext.LayerDetails(name, context.project(), output))
+
+    def _add_raster(self, uri, name, context, feedback):
+        layer = QgsRasterLayer(uri, name, "gdal")
+        if not layer.isValid():
+            feedback.pushWarning("output written but could not be opened as a raster: " + uri)
+            return
+        self._add_to_project(layer, name, self.OUTPUT_LAYER, context)
+        feedback.pushInfo(f"raster layer added: {name}, {layer.bandCount()} band(s) "
+                          "(1 band = 1 time step)")
+
+    def _add_mesh(self, path, name, result, context, feedback):
+        win = result.get("window")
+        cells = (win[1] - win[0]) * (win[3] - win[2]) if win else None
+        if cells is None or cells > MESH_CELL_WARNING:
+            feedback.pushWarning("large grid for a mesh layer: opening and drawing may be slow. "
+                                 "Limit the output extent, or add it as a raster.")
+        layer = QgsMeshLayer(path, name, "mdal")
+        if not layer.isValid():
+            feedback.pushWarning("output written but could not be opened as a mesh (MDAL): "
+                                 + path)
+            return
+        if not layer.crs().isValid():
+            layer.setCrs(QgsCoordinateReferenceSystem(GRID_CRS))
+        self._add_to_project(layer, name, self.OUTPUT_MESH, context)
+        tp = layer.temporalProperties()
+        span = ""
+        if tp.isActive():
+            ext = tp.timeExtent()
+            span = (f", time {ext.begin().toString('yyyy-MM-dd HH:mm')} .. "
+                    f"{ext.end().toString('yyyy-MM-dd HH:mm')} UTC (use the Temporal Controller)")
+        feedback.pushInfo(f"mesh layer added: {name}, {layer.dataProvider().faceCount()} faces"
+                          + span)
 
     def _bbox(self, parameters, context, feedback):
         """Requested output extent as (west, south, east, north) in GRID_CRS, or None."""
